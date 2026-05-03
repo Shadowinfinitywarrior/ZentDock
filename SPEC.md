@@ -7,7 +7,7 @@
 **Developer:** Mr. Nithish Kathiravan  
 **Contact:** nithishkathiravan123@gmail.com / infonity404@gmail.com  
 **Phone/WhatsApp:** +91 9342358022  
-**GitHub:** [infonity404](https://github.com/infonity404)
+**GitHub:** [Shadowinfinitywarrior](https://github.com/Shadowinfinitywarrior)
 
 ================================================================================
                               PROJECT OVERVIEW
