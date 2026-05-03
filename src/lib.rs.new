@@ -1,0 +1,232 @@
+pub struct RMSDCalculator;
+
+impl RMSDCalculator {
+    pub fn calculate(mol1: &Molecule, mol2: &Molecule) -> f64 {
+        if mol1.num_atoms() != mol2.num_atoms() { return f64::INFINITY; }
+        let mut sum = 0.0;
+        for (a1, a2) in mol1.atoms.iter().zip(mol2.atoms.iter()) {
+            if a1.element == a2.element {
+                sum += a1.position.distance(&a2.position).powi(2);
+            }
+        }
+        (sum / mol1.num_atoms() as f64).sqrt()
+    }
+
+    pub fn cluster_poses(poses: &[DockingResult], config: &DockingConfig, ligand: &Molecule) -> Vec<Vec<usize>> {
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for (i, pose) in poses.iter().enumerate() {
+            let transformed = ligand.shifted(&pose.transform);
+            let mut found = false;
+            for cluster in &mut clusters {
+                if let Some(&first) = cluster.first() {
+                    let first_ligand = ligand.shifted(&poses[first].transform);
+                    if Self::calculate(&first_ligand, &transformed) < config.cluster_rmsd {
+                        cluster.push(i); found = true; break;
+                    }
+                }
+            }
+            if !found { clusters.push(vec![i]); }
+        }
+        clusters.sort_by(|a, b| b.len().partial_cmp(&a.len()).unwrap());
+        clusters
+    }
+}
+
+pub struct StructurePreparer;
+
+impl StructurePreparer {
+    pub fn prepare_receptor(mol: &mut Molecule, remove_waters: bool, add_hydrogens: bool,
+        assign_charges: bool, keep_waters: bool) {
+        println!("\n=== Preparing Receptor ===");
+        if !keep_waters {
+            let water_count = mol.atoms.iter().filter(|a| {
+                a.residue_name == "HOH" || a.residue_name == "WAT" || a.residue_name == "WATER"
+            }).count();
+            mol.atoms.retain(|a| {
+                a.residue_name != "HOH" && a.residue_name != "WAT" && a.residue_name != "WATER"
+            });
+            if water_count > 0 { println!("  Removed {} water molecules", water_count); }
+        }
+        if add_hydrogens { Self::add_hydrogens(mol); }
+        if assign_charges { Self::assign_gasteiger_charges(mol); }
+        println!("  Final atom count: {}", mol.num_atoms());
+    }
+
+    pub fn prepare_ligand(mol: &mut Molecule, add_hydrogens: bool, assign_charges: bool, _tautomers: bool) {
+        println!("\n=== Preparing Ligand ===");
+        let pre = mol.num_atoms();
+        mol.atoms.retain(|a| a.residue_name != "HOH" && a.residue_name != "WAT");
+        if add_hydrogens { Self::add_hydrogens(mol); }
+        if assign_charges { Self::assign_gasteiger_charges(mol); }
+        Self::detect_aromatic_rings(mol);
+        println!("  Atom count: {} -> {}", pre, mol.num_atoms());
+        println!("  Heavy atoms: {}", mol.heavy_atom_count());
+    }
+
+    fn add_hydrogens(mol: &mut Molecule) {
+        let mut new_atoms: Vec<Atom> = Vec::new();
+        let mut atom_id = mol.num_atoms();
+        let heavy_atoms: Vec<_> = mol.atoms.iter().filter(|a| !a.element.is_hydrogen()).cloned().collect();
+        for atom in heavy_atoms {
+            let num_h = match atom.element {
+                Element::O | Element::S => 1,
+                Element::N => 2,
+                Element::C => {
+                    let bonded_non_h = mol.bonds.iter().filter(|b| {
+                        (b.atom1 == atom.id || b.atom2 == atom.id) && {
+                            let other = if b.atom1 == atom.id { b.atom2 } else { b.atom1 };
+                            mol.atoms.iter().any(|a| a.id == other && !a.element.is_hydrogen())
+                        }
+                    }).count();
+                    match atom.element.max_bonds() as usize {
+                        n if n > bonded_non_h => n - bonded_non_h,
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            };
+            for _ in 0..num_h {
+                let offset = Vector3D::new(0.0, 1.1, 0.0);
+                let mut h_atom = Atom::new(atom_id, Element::H, atom.position.add(&offset));
+                h_atom.name = "H".to_string(); h_atom.residue_name = atom.residue_name.clone();
+                h_atom.residue_id = atom.residue_id; h_atom.chain_id = atom.chain_id.clone();
+                h_atom.partial_charge = 0.0;
+                new_atoms.push(h_atom);
+                atom_id += 1;
+            }
+        }
+        mol.atoms.extend(new_atoms);
+    }
+
+    fn assign_gasteiger_charges(mol: &mut Molecule) {
+        for atom in &mut mol.atoms {
+            atom.partial_charge = match atom.element {
+                Element::C => match mol.bonds.iter().filter(|b| b.atom1 == atom.id || b.atom2 == atom.id).count() {
+                    4 => -0.2, 3 => -0.1, _ => 0.0,
+                },
+                Element::N => -0.3,
+                Element::O => -0.4,
+                Element::H => 0.1,
+                _ => 0.0,
+            };
+        }
+    }
+
+    fn detect_aromatic_rings(_mol: &mut Molecule) {}
+}
+
+pub struct JobManager;
+
+impl JobManager {
+    pub fn submit_docking(receptor: Molecule, ligand: Molecule, config: DockingConfig) -> Vec<DockingResult> {
+        println!("\n========================================");
+        println!("       Starting Docking Job");
+        println!("========================================");
+        println!("  Receptor: {} atoms ({:?})", receptor.num_atoms(), receptor.molecule_type);
+        println!("  Ligand: {} atoms ({:?})", ligand.num_atoms(), ligand.molecule_type);
+        println!("  Algorithm: {:?}", config.algorithm);
+        println!("  Scoring: {:?}", config.scoring_function);
+        println!("  Search Box: {:.1} x {:.1} x {:.1} A", config.search_box_size, config.search_box_size, config.search_box_size);
+        println!("  Num Poses: {}", config.num_poses);
+        println!("  Max Iterations: {}", config.max_iterations);
+
+        let results = DockingEngine::dock(&receptor, &ligand, &config);
+
+        if config.rmsd_clustering {
+            println!("\n=== RMSD Clustering ===");
+            let clusters = RMSDCalculator::cluster_poses(&results, &config, &ligand);
+            for (i, cluster) in clusters.iter().enumerate().take(10) {
+                println!("  Cluster {}: {} poses", i + 1, cluster.len());
+            }
+        }
+
+        println!("\n========================================");
+        println!("       Docking Complete");
+        println!("========================================");
+        println!("  Generated {} poses", results.len());
+        for (i, r) in results.iter().take(5).enumerate() {
+            println!("  Rank {}: E = {:.4} kcal/mol", r.rank, r.energy);
+        }
+        results
+    }
+
+    pub fn create_complex(receptor: &Molecule, ligand: &Molecule, result: &DockingResult, format: &str) -> String {
+        match format {
+            "pdbqt" => MoleculeParser::write_complex_pdbqt(receptor, ligand, &result.transform, true),
+            _ => MoleculeParser::write_complex(receptor, ligand),
+        }
+    }
+}
+
+pub struct Config {
+    pub version: String,
+    pub num_threads: usize,
+    pub default_algorithm: String,
+    pub default_scoring: String,
+    pub default_num_poses: usize,
+    pub default_max_iterations: usize,
+    pub output_dir: String,
+}
+
+impl Config {
+    pub fn version() -> String { "1.0.0".to_string() }
+    pub fn load(_path: &str) -> Self { Self::default() }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: "1.0.0".to_string(),
+            num_threads: 4,
+            default_algorithm: "multistage".to_string(),
+            default_scoring: "vina".to_string(),
+            default_num_poses: 10,
+            default_max_iterations: 25000,
+            output_dir: ".".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vector_operations() {
+        let v1 = Vector3D::new(1.0, 0.0, 0.0);
+        let v2 = Vector3D::new(0.0, 1.0, 0.0);
+        let sum = v1.add(&v2);
+        assert!((sum.x - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_molecule_parsing() {
+        let pdb = "ATOM      1  N   ASP A   1       0.000   0.000   0.000  1.00  0.00           N\n";
+        let mol = MoleculeParser::parse_pdb(pdb);
+        assert_eq!(mol.num_atoms(), 1);
+    }
+
+    #[test]
+    fn test_scoring() {
+        let receptor = Molecule::new("1".to_string(), "Rec".to_string(), MoleculeType::Protein);
+        let ligand = Molecule::new("2".to_string(), "Lig".to_string(), MoleculeType::Ligand);
+        let transform = Transform::identity();
+        let energy = AutoDock4Scoring::calculate(&receptor, &ligand, &transform);
+        assert!(energy.is_finite());
+    }
+    #[test]
+    fn test_element_properties() {
+        let c = Element::C;
+        assert_eq!(c.atomic_number(), 6);
+        assert!(c.vdw_radius() > 0.0);
+        assert!(c.is_hb_acceptor() || c.is_hb_donor());
+    }
+
+    #[test]
+    fn test_vina_scoring_types() {
+        let c_h = VinaAtomType::C_H;
+        let (r, d) = c_h.radius_and_well();
+        assert!(r > 0.0);
+        assert!(d > 0.0);
+    }
+}

@@ -1,0 +1,645 @@
+
+
+        let mut rng = rand::thread_rng();
+        let mut monitor = ProgressMonitor::new("LGA", config.max_iterations, ".");
+        monitor.checkpoint_interval = config.checkpoint_interval;
+        monitor.enable_checkpoint(config.checkpoint_interval > 0);
+        let box_size = config.search_box_size;
+
+        let mut population: Vec<(Transform, f64)> = (0..config.population_size)
+            .map(|_| {
+                let tx = rng.gen_range(-box_size..box_size);
+                let ty = rng.gen_range(-box_size..box_size);
+                let tz = rng.gen_range(-box_size..box_size);
+                let rotation = RotationMatrix::random();
+                let translation = search_center.add(&Vector3D::new(tx, ty, tz));
+                let transform = Transform::new(rotation, translation);
+                let energy = Self::score_with_function(receptor, ligand, &transform, &config.scoring_function);
+                (transform, energy)
+            }).collect();
+        population.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        let mut prev_best = f64::INFINITY;
+        let mut converged = 0;
+        let mut poses_found = 0;
+        if config.real_time_monitoring { println!("  [Real-time monitoring enabled]"); }
+
+        for iteration in 0..config.max_iterations {
+            if monitor.check_interrupt() { println!("  [INTERRUPTED by user]"); break; }
+
+            let best_change = (population[0].1 - prev_best).abs();
+            prev_best = population[0].1;
+
+            if config.convergence_early_stop && iteration > 1000 && best_change < config.convergence_delta {
+                converged += 1;
+                if converged > config.convergence_lookback {
+                    println!("  [CONVERGED] LGA at iteration {} (E = {:.4})", iteration, population[0].1);
+                    break;
+                }
+            } else { converged = 0; }
+
+            let diversity = if population.len() > 1 {
+                let energies: Vec<f64> = population.iter().map(|(_, e)| *e).collect();
+                let mean = energies.iter().sum::<f64>() / energies.len() as f64;
+                let var = energies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / energies.len() as f64;
+                var.sqrt()
+            } else { 0.0 };
+
+            if config.real_time_monitoring {
+                monitor.update(iteration, population[0].1, iteration * config.population_size, diversity);
+                if iteration % config.progress_update_interval == 0 || iteration < 10 { monitor.display_iteration(); }
+            } else if iteration % 2000 == 0 {
+                println!("  LGA: {}/{} Best E: {:.4} div: {:.4}", iteration, config.max_iterations, population[0].1, diversity);
+            }
+
+            let mut new_pop = Vec::new();
+            new_pop.push(population[0].clone());
+
+            for i in 1..config.population_size {
+                let parent_idx = rng.gen_range(0..config.population_size);
+                let mut transform = population[parent_idx].0.clone();
+
+                if rng.gen::<f64>() < 0.5 {
+                    transform = Self::local_optimization(receptor, ligand, &transform, &config.scoring_function);
+                } else if rng.gen::<f64>() < config.mutation_rate {
+                    transform.translation = transform.translation.add(&Vector3D::new(
+                        rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)));
+                }
+
+                let energy = Self::score_with_function(receptor, ligand, &transform, &config.scoring_function);
+                new_pop.push((transform, energy));
+            }
+            new_pop.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            population = new_pop;
+
+            if config.streaming_output {
+                let cb = population[0].clone();
+                if (prev_best - cb.1).abs() > 0.001 || poses_found == 0 {
+                    poses_found += 1;
+                    prev_best = cb.1;
+                    let result = DockingResult {
+                        rank: poses_found, energy: cb.1, transform: cb.0.clone(),
+                        rmsd: 0.0, cluster_id: poses_found, cluster_size: 1,
+                        ligand_atoms: ligand.clone().shifted(&cb.0).atoms,
+                    };
+                    if config.real_time_monitoring {
+                        monitor.record_pose(cb.1);
+                        monitor.save_best_pose_streaming(&result, ligand, poses_found).ok();
+                    }
+                }
+            }
+        }
+
+        let mut results = Vec::new();
+        for (idx, (t, e)) in population.iter().take(config.num_poses).enumerate() {
+            results.push(DockingResult {
+                rank: idx + 1, energy: *e, transform: t.clone(),
+                rmsd: 0.0, cluster_id: idx, cluster_size: 1,
+                ligand_atoms: ligand.clone().shifted(t).atoms,
+            });
+        }
+        results.sort_by(|a, b| a.energy.partial_cmp(&b.energy).unwrap());
+        for (i, r) in results.iter_mut().enumerate() { r.rank = i + 1; }
+        if config.real_time_monitoring { monitor.progress.display(); }
+        results.truncate(config.num_poses);
+        results
+    }
+
+    fn pso_algorithm(receptor: &Molecule, ligand: &Molecule,
+        config: &DockingConfig, search_center: Vector3D) -> Vec<DockingResult> {
+        let mut rng = rand::thread_rng();
+        let mut monitor = ProgressMonitor::new("PSO", config.max_iterations, ".");
+        monitor.checkpoint_interval = config.checkpoint_interval;
+        monitor.enable_checkpoint(config.checkpoint_interval > 0);
+        let box_size = config.search_box_size;
+        let c1 = 1.496; let c2 = 1.496; let w = 0.729;
+
+        let mut particles: Vec<(Transform, f64, Transform)> = (0..config.population_size)
+            .map(|_| {
+                let tx = rng.gen_range(-box_size..box_size);
+                let ty = rng.gen_range(-box_size..box_size);
+                let tz = rng.gen_range(-box_size..box_size);
+                let rotation = RotationMatrix::identity();
+                let translation = search_center.add(&Vector3D::new(tx, ty, tz));
+                let transform = Transform::new(rotation, translation);
+                let energy = Self::score_with_function(receptor, ligand, &transform, &config.scoring_function);
+                (transform, energy, transform.clone())
+            }).collect();
+
+        let mut global_best = particles[0].clone();
+        for p in &particles { if p.1 < global_best.1 { global_best = p.clone(); } }
+
+        let mut prev_best = global_best.1;
+        let mut converged = 0;
+        let mut best_count = 0;
+        if config.real_time_monitoring { println!("  [Real-time monitoring enabled]"); }
+
+        for iteration in 0..config.max_iterations {
+            if monitor.check_interrupt() { println!("  [INTERRUPTED by user]"); break; }
+
+            let best_change = (global_best.1 - prev_best).abs();
+            prev_best = global_best.1;
+
+            if config.convergence_early_stop && iteration > 500 && best_change < config.convergence_delta {
+                converged += 1;
+                if converged > config.convergence_lookback {
+                    println!("  [CONVERGED] PSO at iteration {} (E = {:.4})", iteration, global_best.1);
+                    break;
+                }
+            } else { converged = 0; }
+
+            let diversity = if particles.len() > 1 {
+                let energies: Vec<f64> = particles.iter().map(|p| p.1).collect();
+                let mean = energies.iter().sum::<f64>() / energies.len() as f64;
+                let var = energies.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / energies.len() as f64;
+                var.sqrt()
+            } else { 0.0 };
+
+            if config.real_time_monitoring {
+                monitor.update(iteration, global_best.1, iteration * config.population_size, diversity);
+                if iteration % config.progress_update_interval == 0 || iteration < 10 { monitor.display_iteration(); }
+            } else if iteration % 2000 == 0 {
+                println!("  PSO: {}/{} Best E: {:.4} div: {:.4}", iteration, config.max_iterations, global_best.1, diversity);
+            }
+
+            for particle in &mut particles {
+                let r1: f64 = rng.gen(); let r2: f64 = rng.gen();
+                let new_trans = Transform::new(particle.0.rotation.clone(),
+                    Vector3D::new(
+                        w * particle.0.translation.x + c1 * r1 * (particle.2.translation.x - particle.0.translation.x)
+                            + c2 * r2 * (global_best.0.translation.x - particle.0.translation.x),
+                        w * particle.0.translation.y + c1 * r1 * (particle.2.translation.y - particle.0.translation.y)
+                            + c2 * r2 * (global_best.0.translation.y - particle.0.translation.y),
+                        w * particle.0.translation.z + c1 * r1 * (particle.2.translation.z - particle.0.translation.z)
+                            + c2 * r2 * (global_best.0.translation.z - particle.0.translation.z),
+                    ));
+                let energy = Self::score_with_function(receptor, ligand, &new_trans, &config.scoring_function);
+                if energy < particle.1 { *particle = (new_trans.clone(), energy, particle.0.clone()); }
+                if particle.1 < global_best.1 { global_best = (new_trans, energy, particle.2.clone()); }
+            }
+
+            if config.streaming_output {
+                if (prev_best - global_best.1).abs() > 0.001 || best_count == 0 {
+                    best_count += 1; prev_best = global_best.1;
+                    let result = DockingResult {
+                        rank: best_count, energy: global_best.1, transform: global_best.0.clone(),
+                        rmsd: 0.0, cluster_id: best_count, cluster_size: 1,
+                        ligand_atoms: ligand.clone().shifted(&global_best.0).atoms,
+                    };
+                    if config.real_time_monitoring {
+                        monitor.record_pose(global_best.1);
+                        monitor.save_best_pose_streaming(&result, ligand, best_count).ok();
+                    }
+                }
+            }
+        }
+
+        let mut results = vec![DockingResult {
+            rank: 1, energy: global_best.1, transform: global_best.0.clone(),
+            rmsd: 0.0, cluster_id: 0, cluster_size: 1,
+            ligand_atoms: ligand.clone().shifted(&global_best.0).atoms,
+        }];
+        let mut sorted: Vec<_> = particles.iter().collect();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        for (pso_idx, p) in sorted.iter().take(config.num_poses).enumerate() {
+            if pso_idx == 0 { continue; }
+            let exists = results.iter().any(|r| (r.energy - p.1).abs() < 0.0001);
+            if !exists {
+                results.push(DockingResult {
+                    rank: pso_idx + 1, energy: p.1, transform: p.0.clone(),
+                    rmsd: 0.0, cluster_id: pso_idx, cluster_size: 1,
+                    ligand_atoms: ligand.clone().shifted(&p.0).atoms,
+                });
+            }
+        }
+        results.sort_by(|a, b| a.energy.partial_cmp(&b.energy).unwrap());
+        for (i, r) in results.iter_mut().enumerate() { r.rank = i + 1; }
+        if config.real_time_monitoring { monitor.progress.display(); }
+        results.truncate(config.num_poses);
+        results
+    }
+
+    fn simulated_annealing(receptor: &Molecule, ligand: &Molecule,
+        config: &DockingConfig, search_center: Vector3D) -> Vec<DockingResult> {
+        let mut rng = rand::thread_rng();
+        let mut monitor = ProgressMonitor::new("SA", config.max_iterations, ".");
+        monitor.checkpoint_interval = config.checkpoint_interval;
+        monitor.enable_checkpoint(config.checkpoint_interval > 0);
+        let box_size = config.search_box_size;
+
+        let temp_start = 1000.0_f64; let temp_end = 1.0_f64;
+        let num_iters_f = config.max_iterations as f64;
+        let cooling_rate = (temp_end / temp_start).powf(1.0_f64 / num_iters_f);
+
+        let tx = rng.gen_range(-box_size..box_size);
+        let ty = rng.gen_range(-box_size..box_size);
+        let tz = rng.gen_range(-box_size..box_size);
+        let rotation = RotationMatrix::identity();
+        let mut current = Transform::new(rotation, search_center.add(&Vector3D::new(tx, ty, tz)));
+        let mut current_energy = Self::score_with_function(receptor, ligand, &current, &config.scoring_function);
+
+        let mut best = current.clone();
+        let mut best_energy = current_energy;
+        let mut temp = temp_start;
+        let mut prev_best = best_energy;
+        let mut converged = 0;
+        let mut accepted = 0;
+        let mut total = 0;
+        if config.real_time_monitoring { println!("  [Real-time monitoring enabled]"); }
+
+        for iteration in 0..config.max_iterations {
+            if monitor.check_interrupt() { println!("  [INTERRUPTED by user]"); break; }
+            total += 1;
+
+            let new_trans = Transform::new(current.rotation.clone(),
+                current.translation.add(&Vector3D::new(
+                    rng.gen_range(-box_size / 10.0..box_size / 10.0),
+                    rng.gen_range(-box_size / 10.0..box_size / 10.0),
+                    rng.gen_range(-box_size / 10.0..box_size / 10.0),
+                )));
+            let new_energy = Self::score_with_function(receptor, ligand, &new_trans, &config.scoring_function);
+
+            let delta = new_energy - current_energy;
+            if delta < 0.0 || rng.gen::<f64>() < (-delta / temp).exp() {
+                current = new_trans; current_energy = new_energy; accepted += 1;
+                if current_energy < best_energy { best = current.clone(); best_energy = current_energy; }
+            }
+            temp *= cooling_rate;
+
+            let best_change = (best_energy - prev_best).abs();
+            prev_best = best_energy;
+
+            if config.convergence_early_stop && iteration > 1000 && best_change < config.convergence_delta {
+                converged += 1;
+                if converged > config.convergence_lookback {
+                    println!("  [CONVERGED] SA at iteration {} (E = {:.4})", iteration, best_energy);
+                    break;
+                }
+            } else { converged = 0; }
+
+            if config.real_time_monitoring {
+                let div = (accepted as f64) / (total as f64).max(1.0);
+                monitor.update(iteration, best_energy, iteration + 1, div);
+                if iteration % config.progress_update_interval == 0 || iteration < 10 {
+                    println!("  SA: {}/{} T: {:.2} E: {:.4} acc: {:.1}%",
+                        iteration, config.max_iterations, temp, best_energy, div * 100.0);
+                    monitor.display_iteration();
+                }
+            } else if iteration % 2000 == 0 {
+                println!("  SA: {}/{} T: {:.2} Best E: {:.4}",
+                    iteration, config.max_iterations, temp, best_energy);
+            }
+
+            if config.checkpoint_interval > 0 && iteration > 0 && iteration % config.checkpoint_interval == 0 {
+                let r = DockingResult { rank: 1, energy: best_energy, transform: best.clone(),
+                    rmsd: 0.0, cluster_id: 0, cluster_size: 1,
+                    ligand_atoms: ligand.clone().shifted(&best).atoms };
+                monitor.save_checkpoint(&vec![r.clone()], ligand, iteration).ok();
+            }
+
+            if config.streaming_output && (prev_best - best_energy).abs() > 0.001 {
+                let r = DockingResult { rank: 1, energy: best_energy, transform: best.clone(),
+                    rmsd: 0.0, cluster_id: 0, cluster_size: 1,
+                    ligand_atoms: ligand.clone().shifted(&best).atoms };
+                if config.real_time_monitoring {
+                    monitor.record_pose(best_energy);
+                    monitor.save_best_pose_streaming(&r, ligand, 1).ok();
+                }
+            }
+        }
+        if config.real_time_monitoring { monitor.progress.display(); }
+        vec![DockingResult { rank: 1, energy: best_energy, transform: best.clone(),
+            rmsd: 0.0, cluster_id: 0, cluster_size: 1,
+            ligand_atoms: ligand.shifted(&best).atoms }]
+    }
+
+    fn multistage_docking(receptor: &Molecule, ligand: &Molecule,
+        config: &DockingConfig, search_center: Vector3D) -> Vec<DockingResult> {
+        println!("\n=== Stage 1: Rigid Body Search (GA) ===");
+        let rigid_config = DockingConfig {
+            max_iterations: config.max_iterations / 3,
+            population_size: config.population_size,
+            search_box_size: config.search_box_size * 1.5,
+            real_time_monitoring: config.real_time_monitoring,
+            streaming_output: config.streaming_output,
+            checkpoint_interval: config.checkpoint_interval,
+            progress_update_interval: config.progress_update_interval,
+            convergence_early_stop: config.convergence_early_stop,
+            convergence_lookback: config.convergence_lookback,
+            convergence_delta: config.convergence_delta,
+            early_terminate: config.early_terminate,
+            adaptive_sampling: config.adaptive_sampling,
+            cache_scoring: config.cache_scoring,
+            ..config.clone()
+        };
+        let rigid_results = Self::genetic_algorithm(receptor, ligand, &rigid_config, search_center);
+
+        println!("\n=== Stage 2: Semi-Flexible Optimization ===");
+        let mut refined_results = Vec::new();
+        let mut idx = 0;
+        for rigid_result in rigid_results.iter().take(config.num_poses) {
+            let local_opt = Self::local_optimization(receptor, ligand, &rigid_result.transform,
+                &config.scoring_function);
+            let energy = Self::score_with_function(receptor, ligand, &local_opt, &config.scoring_function);
+            idx += 1;
+            println!("  Pose {}: E = {:.4}", idx, energy);
+
+            if config.real_time_monitoring && config.streaming_output {
+                let result = DockingResult {
+                    rank: idx, energy, transform: local_opt.clone(),
+                    rmsd: 0.0, cluster_id: idx, cluster_size: 1,
+                    ligand_atoms: ligand.clone().shifted(&local_opt).atoms,
+                };
+                std::fs::create_dir_all(format!("{}/streaming_poses", ".")).ok();
+                let _ = std::fs::write(
+                    format!("./streaming_poses/pose_stage2_{}_E{:.4}.pdb", idx, energy),
+                    MoleculeParser::write_pdb(&ligand.clone().shifted(&local_opt), None),
+                );
+            }
+            refined_results.push(DockingResult {
+                rank: idx, energy, transform: local_opt,
+                rmsd: 0.0, cluster_id: idx, cluster_size: 1,
+                ligand_atoms: ligand.clone().shifted(&local_opt).atoms,
+            });
+        }
+
+        println!("\n=== Stage 3: Final Refinement (PSO) ===");
+        let stage3_config = DockingConfig {
+            algorithm: DockingAlgorithm::PSO,
+            max_iterations: (config.max_iterations / 3).max(1000),
+            population_size: config.num_poses.max(10),
+            search_box_size: config.search_box_size * 0.5,
+            ..rigid_config
+        };
+        let pso_results = Self::pso_algorithm(receptor, ligand, &stage3_config, search_center);
+
+        for result in pso_results {
+            let exists = refined_results.iter().any(|r| (r.energy - result.energy).abs() < 0.001);
+            if !exists { refined_results.push(result); }
+        }
+        refined_results.sort_by(|a, b| a.energy.partial_cmp(&b.energy).unwrap());
+        for (i, r) in refined_results.iter_mut().enumerate() { r.rank = i + 1; }
+        if config.real_time_monitoring {
+            if let Some(best) = refined_results.first() {
+                println!("\n[MULTISTAGE] Best pose: E = {:.4} kcal/mol", best.energy);
+            }
+        }
+        refined_results.truncate(config.num_poses);
+        refined_results
+    }
+
+    fn score_with_function(receptor: &Molecule, ligand: &Molecule,
+        transform: &Transform, function: &ScoringFunction) -> f64 {
+        match function {
+            ScoringFunction::AutoDock4 => AutoDock4Scoring::calculate(receptor, ligand, transform),
+            ScoringFunction::Vina => VinaScoring::calculate(receptor, ligand, transform, None),
+            ScoringFunction::ChemScore => AutoDock4Scoring::calculate(receptor, ligand, transform),
+        }
+    }
+
+    fn local_optimization(receptor: &Molecule, ligand: &Molecule,
+        transform: &Transform, function: &ScoringFunction) -> Transform {
+        let mut best = transform.clone();
+        let mut best_energy = Self::score_with_function(receptor, ligand, &best, function);
+        for _ in 0..200 {
+            let improved = best.translation.add(&Vector3D::new(0.1, 0.1, 0.1));
+            let test = Transform::new(best.rotation.clone(), improved);
+            let energy = Self::score_with_function(receptor, ligand, &test, function);
+            if energy < best_energy { best = test; best_energy = energy; }
+        }
+        best
+    }
+}
+
+pub struct RMSDCalculator;
+
+impl RMSDCalculator {
+    pub fn calculate(mol1: &Molecule, mol2: &Molecule) -> f64 {
+        if mol1.num_atoms() != mol2.num_atoms() { return f64::INFINITY; }
+        let mut sum = 0.0;
+        for (a1, a2) in mol1.atoms.iter().zip(mol2.atoms.iter()) {
+            if a1.element == a2.element {
+                sum += a1.position.distance(&a2.position).powi(2);
+            }
+        }
+        (sum / mol1.num_atoms() as f64).sqrt()
+    }
+
+    pub fn cluster_poses(poses: &[DockingResult], config: &DockingConfig, ligand: &Molecule) -> Vec<Vec<usize>> {
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        for (i, pose) in poses.iter().enumerate() {
+            let transformed = ligand.shifted(&pose.transform);
+            let mut found = false;
+            for cluster in &mut clusters {
+                if let Some(&first) = cluster.first() {
+                    let first_ligand = ligand.shifted(&poses[first].transform);
+                    if Self::calculate(&first_ligand, &transformed) < config.cluster_rmsd {
+                        cluster.push(i); found = true; break;
+                    }
+                }
+            }
+            if !found { clusters.push(vec![i]); }
+        }
+        clusters.sort_by(|a, b| b.len().partial_cmp(&a.len()).unwrap());
+        clusters
+    }
+}
+
+pub struct StructurePreparer;
+
+impl StructurePreparer {
+    pub fn prepare_receptor(mol: &mut Molecule, remove_waters: bool, add_hydrogens: bool,
+        assign_charges: bool, keep_waters: bool) {
+        println!("\n=== Preparing Receptor ===");
+        if !keep_waters {
+            let water_count = mol.atoms.iter().filter(|a| {
+                a.residue_name == "HOH" || a.residue_name == "WAT" || a.residue_name == "WATER"
+            }).count();
+            mol.atoms.retain(|a| {
+                a.residue_name != "HOH" && a.residue_name != "WAT" && a.residue_name != "WATER"
+            });
+            if water_count > 0 { println!("  Removed {} water molecules", water_count); }
+        }
+        if add_hydrogens { Self::add_hydrogens(mol); }
+        if assign_charges { Self::assign_gasteiger_charges(mol); }
+        println!("  Final atom count: {}", mol.num_atoms());
+    }
+
+    pub fn prepare_ligand(mol: &mut Molecule, add_hydrogens: bool, assign_charges: bool, _tautomers: bool) {
+        println!("\n=== Preparing Ligand ===");
+        let pre = mol.num_atoms();
+        mol.atoms.retain(|a| a.residue_name != "HOH" && a.residue_name != "WAT");
+        if add_hydrogens { Self::add_hydrogens(mol); }
+        if assign_charges { Self::assign_gasteiger_charges(mol); }
+        Self::detect_aromatic_rings(mol);
+        println!("  Atom count: {} -> {}", pre, mol.num_atoms());
+        println!("  Heavy atoms: {}", mol.heavy_atom_count());
+    }
+
+    fn add_hydrogens(mol: &mut Molecule) {
+        let mut new_atoms: Vec<Atom> = Vec::new();
+        let mut atom_id = mol.num_atoms();
+        let heavy_atoms: Vec<_> = mol.atoms.iter().filter(|a| !a.element.is_hydrogen()).cloned().collect();
+        for atom in heavy_atoms {
+            let num_h = match atom.element {
+                Element::O | Element::S => 1,
+                Element::N => 2,
+                Element::C => {
+                    let bonded_non_h = mol.bonds.iter().filter(|b| {
+                        (b.atom1 == atom.id || b.atom2 == atom.id) && {
+                            let other = if b.atom1 == atom.id { b.atom2 } else { b.atom1 };
+                            mol.atoms.iter().any(|a| a.id == other && !a.element.is_hydrogen())
+                        }
+                    }).count();
+                    match atom.element.max_bonds() as usize {
+                        n if n > bonded_non_h => n - bonded_non_h,
+                        _ => 0,
+                    }
+                }
+                _ => 0,
+            };
+            for _ in 0..num_h {
+                let offset = Vector3D::new(0.0, 1.1, 0.0);
+                let mut h_atom = Atom::new(atom_id, Element::H, atom.position.add(&offset));
+                h_atom.name = "H".to_string(); h_atom.residue_name = atom.residue_name.clone();
+                h_atom.residue_id = atom.residue_id; h_atom.chain_id = atom.chain_id.clone();
+                h_atom.partial_charge = 0.0;
+                new_atoms.push(h_atom);
+                atom_id += 1;
+            }
+        }
+        mol.atoms.extend(new_atoms);
+    }
+
+    fn assign_gasteiger_charges(mol: &mut Molecule) {
+        for atom in &mut mol.atoms {
+            atom.partial_charge = match atom.element {
+                Element::C => match mol.bonds.iter().filter(|b| b.atom1 == atom.id || b.atom2 == atom.id).count() {
+                    4 => -0.2, 3 => -0.1, _ => 0.0,
+                },
+                Element::N => -0.3,
+                Element::O => -0.4,
+                Element::H => 0.1,
+                _ => 0.0,
+            };
+        }
+    }
+
+    fn detect_aromatic_rings(_mol: &mut Molecule) {}
+}
+
+pub struct JobManager;
+
+impl JobManager {
+    pub fn submit_docking(receptor: Molecule, ligand: Molecule, config: DockingConfig) -> Vec<DockingResult> {
+        println!("\n========================================");
+        println!("       Starting Docking Job");
+        println!("========================================");
+        println!("  Receptor: {} atoms ({:?})", receptor.num_atoms(), receptor.molecule_type);
+        println!("  Ligand: {} atoms ({:?})", ligand.num_atoms(), ligand.molecule_type);
+        println!("  Algorithm: {:?}", config.algorithm);
+        println!("  Scoring: {:?}", config.scoring_function);
+        println!("  Search Box: {:.1} x {:.1} x {:.1} A", config.search_box_size, config.search_box_size, config.search_box_size);
+        println!("  Num Poses: {}", config.num_poses);
+        println!("  Max Iterations: {}", config.max_iterations);
+
+        let results = DockingEngine::dock(&receptor, &ligand, &config);
+
+        if config.rmsd_clustering {
+            println!("\n=== RMSD Clustering ===");
+            let clusters = RMSDCalculator::cluster_poses(&results, &config, &ligand);
+            for (i, cluster) in clusters.iter().enumerate().take(10) {
+                println!("  Cluster {}: {} poses", i + 1, cluster.len());
+            }
+        }
+
+        println!("\n========================================");
+        println!("       Docking Complete");
+        println!("========================================");
+        println!("  Generated {} poses", results.len());
+        for (i, r) in results.iter().take(5).enumerate() {
+            println!("  Rank {}: E = {:.4} kcal/mol", r.rank, r.energy);
+        }
+        results
+    }
+
+    pub fn create_complex(receptor: &Molecule, ligand: &Molecule, result: &DockingResult, format: &str) -> String {
+        match format {
+            "pdbqt" => MoleculeParser::write_complex_pdbqt(receptor, ligand, &result.transform, true),
+            _ => MoleculeParser::write_complex(receptor, ligand),
+        }
+    }
+}
+
+pub struct Config {
+    pub version: String,
+    pub num_threads: usize,
+    pub default_algorithm: String,
+    pub default_scoring: String,
+    pub default_num_poses: usize,
+    pub default_max_iterations: usize,
+    pub output_dir: String,
+}
+
+impl Config {
+    pub fn version() -> String { "1.0.0".to_string() }
+    pub fn load(_path: &str) -> Self { Self::default() }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: "1.0.0".to_string(),
+            num_threads: 4,
+            default_algorithm: "multistage".to_string(),
+            default_scoring: "vina".to_string(),
+            default_num_poses: 10,
+            default_max_iterations: 25000,
+            output_dir: ".".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vector_operations() {
+        let v1 = Vector3D::new(1.0, 0.0, 0.0);
+        let v2 = Vector3D::new(0.0, 1.0, 0.0);
+        let sum = v1.add(&v2);
+        assert!((sum.x - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_molecule_parsing() {
+        let pdb = "ATOM      1  N   ASP A   1       0.000   0.000   0.000  1.00  0.00           N\n";
+        let mol = MoleculeParser::parse_pdb(pdb);
+        assert_eq!(mol.num_atoms(), 1);
+    }
+
+    #[test]
+    fn test_scoring() {
+        let receptor = Molecule::new("1".to_string(), "Rec".to_string(), MoleculeType::Protein);
+        let ligand = Molecule::new("2".to_string(), "Lig".to_string(), MoleculeType::Ligand);
+        let transform = Transform::identity();
+        let energy = AutoDock4Scoring::calculate(&receptor, &ligand, &transform);
+        assert!(energy.is_finite());
+    }
+    #[test]
+    fn test_element_properties() {
+        let c = Element::C;
+        assert_eq!(c.atomic_number(), 6);
+        assert!(c.vdw_radius() > 0.0);
+        assert!(c.is_hb_acceptor() || c.is_hb_donor());
+    }
+
+    #[test]
+    fn test_vina_scoring_types() {
+        let c_h = VinaAtomType::C_H;
+        let (r, d) = c_h.radius_and_well();
+        assert!(r > 0.0);
+        assert!(d > 0.0);
+    }
+}
